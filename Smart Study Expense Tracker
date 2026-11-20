@@ -1,0 +1,202 @@
+"""Study & Expense Tracker.
+
+A simple command-line app that logs study sessions and expenses to a
+text file and prints a summary report.
+
+Record format (one per line):  TYPE|title|category|value
+"""
+
+from pathlib import Path
+
+DATA_FILE = Path("data.txt")
+DELIMITER = "|"
+
+MENU = (
+    "1. Add Study Log",
+    "2. Add Expense",
+    "3. View Report",
+    "4. Exit",
+)
+
+
+# --------------------------------------------------------------------------
+# Data models
+# --------------------------------------------------------------------------
+def _sanitize(text: str) -> str:
+    """Remove the delimiter so a field can never corrupt the file format."""
+    return text.replace(DELIMITER, "/").strip()
+
+
+class Record:
+    """Base class for all log entries."""
+
+    record_type = "RECORD"
+
+    def __init__(self, title: str, category: str) -> None:
+        self.title = title
+        self.category = category
+
+    @property
+    def value(self) -> int:
+        raise NotImplementedError
+
+    def to_line(self) -> str:
+        fields = (
+            self.record_type,
+            _sanitize(self.title),
+            _sanitize(self.category),
+            str(self.value),
+        )
+        return DELIMITER.join(fields) + "\n"
+
+
+class StudyLog(Record):
+    record_type = "STUDY"
+
+    def __init__(self, title: str, category: str, minutes: int) -> None:
+        super().__init__(title, category)
+        self.minutes = minutes
+
+    @property
+    def value(self) -> int:
+        return self.minutes
+
+
+class ExpenseLog(Record):
+    record_type = "EXPENSE"
+
+    def __init__(self, title: str, category: str, amount: int) -> None:
+        super().__init__(title, category)
+        self.amount = amount
+
+    @property
+    def value(self) -> int:
+        return self.amount
+
+
+# --------------------------------------------------------------------------
+# Storage
+# --------------------------------------------------------------------------
+def save_record(record: Record) -> None:
+    """Append a record to the data file."""
+    with DATA_FILE.open("a", encoding="utf-8") as file:
+        file.write(record.to_line())
+
+
+def load_records() -> list[dict]:
+    """Load all valid records. Malformed lines are skipped."""
+    if not DATA_FILE.exists():
+        return []
+
+    records = []
+    with DATA_FILE.open("r", encoding="utf-8") as file:
+        for line in file:
+            parts = line.strip().split(DELIMITER)
+            if len(parts) != 4:
+                continue
+            record_type, title, category, raw_value = parts
+            try:
+                value = int(raw_value)
+            except ValueError:
+                continue
+            records.append(
+                {
+                    "type": record_type,
+                    "title": title,
+                    "category": category,
+                    "value": value,
+                }
+            )
+    return records
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+def show_summary() -> None:
+    """Print totals for study time, expenses, and categories used."""
+    data = load_records()
+    if not data:
+        print("No data available yet.")
+        return
+
+    total_minutes = sum(r["value"] for r in data if r["type"] == "STUDY")
+    total_expense = sum(r["value"] for r in data if r["type"] == "EXPENSE")
+    categories = sorted({r["category"] for r in data})
+
+    print("\n--- REPORT ---")
+    print(f"Total Study  : {total_minutes} mins ({total_minutes / 60:.1f} hours)")
+    print(f"Total Expense: Rs. {total_expense}")
+    print(f"Categories   : {', '.join(categories)}")
+
+
+# --------------------------------------------------------------------------
+# Input helpers
+# --------------------------------------------------------------------------
+def read_text(prompt: str) -> str:
+    """Prompt until the user enters a non-empty string."""
+    while True:
+        value = input(prompt).strip()
+        if value:
+            return value
+        print("Input cannot be empty. Please try again.")
+
+
+def read_positive_int(prompt: str) -> int:
+    """Prompt until the user enters a whole number greater than zero."""
+    while True:
+        try:
+            value = int(input(prompt).strip())
+        except ValueError:
+            print("Please enter a valid whole number.")
+            continue
+        if value <= 0:
+            print("Value must be greater than zero.")
+            continue
+        return value
+
+
+# --------------------------------------------------------------------------
+# Menu actions
+# --------------------------------------------------------------------------
+def add_study() -> None:
+    title = read_text("Topic: ")
+    category = read_text("Subject: ")
+    minutes = read_positive_int("Minutes: ")
+    save_record(StudyLog(title, category, minutes))
+    print("Study log saved!")
+
+
+def add_expense() -> None:
+    title = read_text("Item: ")
+    category = read_text("Category: ")
+    amount = read_positive_int("Amount (Rs): ")
+    save_record(ExpenseLog(title, category, amount))
+    print("Expense saved!")
+
+
+def main() -> None:
+    actions = {
+        "1": add_study,
+        "2": add_expense,
+        "3": show_summary,
+    }
+
+    while True:
+        print("\n=== MAIN MENU ===")
+        print("\n".join(MENU))
+        choice = input("Choice (1-4): ").strip()
+
+        if choice == "4":
+            print("Goodbye! Keep coding!")
+            break
+
+        action = actions.get(choice)
+        if action is None:
+            print("Invalid choice. Please select a number from 1 to 4.")
+            continue
+        action()
+
+
+if __name__ == "__main__":
+    main()
