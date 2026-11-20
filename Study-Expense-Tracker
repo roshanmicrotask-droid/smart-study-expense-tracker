@@ -1,0 +1,532 @@
+```python
+"""Study & Expense Tracker CLI.
+
+A lightweight, standard-library-only command-line application for logging
+study sessions and personal expenses with JSON persistence and category
+summary reports.
+
+Usage:
+    python study_expense_tracker.py
+    python study_expense_tracker.py --file my_logs.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import tempfile
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+DEFAULT_DATA_FILE = Path("tracker_data.json")
+CURRENCY_SYMBOL = "Rs."
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
+TWO_PLACES = Decimal("0.01")
+
+
+def _now_timestamp() -> str:
+    """Return the current local timestamp formatted for storage."""
+    return datetime.now().strftime(TIMESTAMP_FORMAT)
+
+
+def _clean_text(value: str, field_name: str) -> str:
+    """Trim whitespace and ensure a required text field is non-empty."""
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return cleaned
+
+
+def format_duration(total_minutes: int) -> str:
+    """Format minutes as a human-readable duration (e.g., '2h 15m (135 mins)')."""
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m ({total_minutes} mins)"
+    if hours:
+        return f"{hours}h ({total_minutes} mins)"
+    return f"{minutes} mins"
+
+
+def format_currency(amount: Decimal) -> str:
+    """Format a Decimal amount with thousand separators and two decimal places."""
+    quantized = amount.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    return f"{CURRENCY_SYMBOL} {quantized:,.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Domain Models
+# ---------------------------------------------------------------------------
+class RecordType(str, Enum):
+    """Supported log entry categories."""
+
+    STUDY = "STUDY"
+    EXPENSE = "EXPENSE"
+
+
+@dataclass(frozen=True)
+class Record(ABC):
+    """Abstract base class for all tracker records."""
+
+    title: str
+    category: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "title", _clean_text(self.title, "Title"))
+        object.__setattr__(self, "category", _clean_text(self.category, "Category"))
+
+    @property
+    @abstractmethod
+    def record_type(self) -> RecordType:
+        """Return the enum identifying this record's type."""
+
+    @property
+    @abstractmethod
+    def display_value(self) -> str:
+        """Return a human-readable string representation of the record's value."""
+
+    @abstractmethod
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the record to a JSON-compatible dictionary."""
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> Record:
+        """Deserialize a dictionary into the matching concrete Record subclass."""
+        if not isinstance(data, dict):
+            raise ValueError("Record payload must be a JSON object.")
+
+        raw_type = data.get("type")
+        try:
+            record_type = RecordType(raw_type)
+        except ValueError as exc:
+            raise ValueError(f"Unknown record type: {raw_type!r}") from exc
+
+        title = str(data.get("title", ""))
+        category = str(data.get("category", ""))
+        created_at = str(data.get("created_at") or _now_timestamp())
+
+        if record_type is RecordType.STUDY:
+            raw_minutes = data.get("minutes")
+            if isinstance(raw_minutes, bool) or not isinstance(raw_minutes, int):
+                raise ValueError("Study minutes must be an integer.")
+            return StudyLog(
+                title=title,
+                category=category,
+                minutes=raw_minutes,
+                created_at=created_at,
+            )
+
+        raw_amount = data.get("amount")
+        if raw_amount is None or isinstance(raw_amount, bool):
+            raise ValueError("Expense amount is missing or invalid.")
+        try:
+            amount = Decimal(str(raw_amount))
+        except InvalidOperation as exc:
+            raise ValueError(f"Invalid expense amount: {raw_amount!r}") from exc
+
+        return ExpenseLog(
+            title=title,
+            category=category,
+            amount=amount,
+            created_at=created_at,
+        )
+
+
+@dataclass(frozen=True)
+class StudyLog(Record):
+    """Represents a single study session measured in minutes."""
+
+    minutes: int
+    created_at: str = field(default_factory=_now_timestamp)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if isinstance(self.minutes, bool) or not isinstance(self.minutes, int):
+            raise ValueError("Study minutes must be a whole number.")
+        if self.minutes <= 0:
+            raise ValueError("Study minutes must be greater than zero.")
+
+    @property
+    def record_type(self) -> RecordType:
+        return RecordType.STUDY
+
+    @property
+    def display_value(self) -> str:
+        return format_duration(self.minutes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.record_type.value,
+            "title": self.title,
+            "category": self.category,
+            "minutes": self.minutes,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class ExpenseLog(Record):
+    """Represents a single monetary expense."""
+
+    amount: Decimal
+    created_at: str = field(default_factory=_now_timestamp)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if isinstance(self.amount, bool) or not isinstance(self.amount, Decimal):
+            raise ValueError("Expense amount must be a Decimal.")
+        if not self.amount.is_finite() or self.amount <= Decimal("0"):
+            raise ValueError("Expense amount must be greater than zero.")
+        quantized = self.amount.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+        object.__setattr__(self, "amount", quantized)
+
+    @property
+    def record_type(self) -> RecordType:
+        return RecordType.EXPENSE
+
+    @property
+    def display_value(self) -> str:
+        return format_currency(self.amount)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.record_type.value,
+            "title": self.title,
+            "category": self.category,
+            "amount": str(self.amount),
+            "created_at": self.created_at,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Storage Layer
+# ---------------------------------------------------------------------------
+class JsonRecordRepository:
+    """Persists records to a JSON file using atomic writes."""
+
+    def __init__(self, file_path: Path = DEFAULT_DATA_FILE) -> None:
+        self.file_path = file_path
+
+    def load_all(self) -> tuple[list[Record], int]:
+        """Load all valid records from disk.
+
+        Returns:
+            A tuple of ``(records, skipped_count)`` where ``skipped_count`` is
+            the number of malformed entries ignored during loading.
+        """
+        if not self.file_path.exists():
+            return [], 0
+
+        raw_text = self.file_path.read_text(encoding="utf-8").strip()
+        if not raw_text:
+            return [], 0
+
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Data file '{self.file_path}' contains invalid JSON."
+            ) from exc
+
+        if not isinstance(payload, list):
+            raise ValueError(
+                f"Data file '{self.file_path}' must contain a JSON list."
+            )
+
+        records: list[Record] = []
+        skipped = 0
+        for item in payload:
+            try:
+                records.append(Record.from_dict(item))
+            except ValueError:
+                skipped += 1
+
+        return records, skipped
+
+    def add(self, record: Record) -> None:
+        """Append a single record and save the file atomically."""
+        records, _ = self.load_all()
+        records.append(record)
+        self._write_all(records)
+
+    def _write_all(self, records: Sequence[Record]) -> None:
+        """Atomically write all records to prevent partial-write corruption."""
+        parent = self.file_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+
+        serialized = [record.to_dict() for record in records]
+        fd, temp_name = tempfile.mkstemp(
+            dir=parent,
+            prefix=f".{self.file_path.stem}_",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                json.dump(serialized, tmp_file, indent=2, ensure_ascii=False)
+                tmp_file.write("\n")
+            temp_path.replace(self.file_path)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Reporting Service
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SummaryReport:
+    """Aggregated study and expense metrics."""
+
+    total_study_minutes: int
+    study_sessions: int
+    study_by_subject: dict[str, int]
+    total_expense: Decimal
+    expense_entries: int
+    expense_by_category: dict[str, Decimal]
+
+    @property
+    def is_empty(self) -> bool:
+        return self.study_sessions == 0 and self.expense_entries == 0
+
+
+def build_summary(records: Sequence[Record]) -> SummaryReport:
+    """Compute totals and per-category breakdowns from a list of records."""
+    study_totals: dict[str, int] = defaultdict(int)
+    expense_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0.00"))
+
+    study_sessions = 0
+    expense_entries = 0
+
+    for record in records:
+        if isinstance(record, StudyLog):
+            study_totals[record.category] += record.minutes
+            study_sessions += 1
+        elif isinstance(record, ExpenseLog):
+            expense_totals[record.category] += record.amount
+            expense_entries += 1
+
+    sorted_study = dict(
+        sorted(study_totals.items(), key=lambda item: (-item[1], item[0].lower()))
+    )
+    sorted_expenses = dict(
+        sorted(expense_totals.items(), key=lambda item: (-item[1], item[0].lower()))
+    )
+
+    return SummaryReport(
+        total_study_minutes=sum(sorted_study.values()),
+        study_sessions=study_sessions,
+        study_by_subject=sorted_study,
+        total_expense=sum(sorted_expenses.values(), Decimal("0.00")),
+        expense_entries=expense_entries,
+        expense_by_category=sorted_expenses,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Command-Line Interface
+# ---------------------------------------------------------------------------
+class TrackerCLI:
+    """Interactive terminal interface for the Study & Expense Tracker."""
+
+    def __init__(self, repository: JsonRecordRepository) -> None:
+        self.repository = repository
+        self._actions: dict[str, tuple[str, Callable[[], None]]] = {
+            "1": ("Add Study Log", self.add_study_log),
+            "2": ("Add Expense", self.add_expense_log),
+            "3": ("View Summary Report", self.show_summary),
+            "4": ("View Recent Logs", self.show_recent_logs),
+        }
+
+    def run(self) -> None:
+        """Start the interactive menu loop."""
+        print("Study & Expense Tracker")
+        print(f"Data file: {self.repository.file_path}")
+
+        try:
+            while True:
+                self._print_menu()
+                choice = input("Select an option (1-5): ").strip()
+
+                if choice == "5":
+                    print("Goodbye! Keep coding!")
+                    return
+
+                entry = self._actions.get(choice)
+                if entry is None:
+                    print("Invalid option. Please enter a number from 1 to 5.")
+                    continue
+
+                _, handler = entry
+                self._execute_safely(handler)
+        except (KeyboardInterrupt, EOFError):
+            print("\nSession ended. Goodbye!")
+
+    def _print_menu(self) -> None:
+        print("\n" + "=" * 34)
+        print("            MAIN MENU")
+        print("=" * 34)
+        for key, (label, _) in self._actions.items():
+            print(f"  {key}. {label}")
+        print("  5. Exit")
+        print("=" * 34)
+
+    @staticmethod
+    def _execute_safely(handler: Callable[[], None]) -> None:
+        try:
+            handler()
+        except (ValueError, OSError) as exc:
+            print(f"Error: {exc}")
+
+    @staticmethod
+    def _prompt_text(prompt: str) -> str:
+        while True:
+            raw = " ".join(input(prompt).split())
+            if raw:
+                return raw
+            print("Input cannot be empty. Please try again.")
+
+    @staticmethod
+    def _prompt_positive_int(prompt: str) -> int:
+        while True:
+            raw = input(prompt).strip()
+            try:
+                value = int(raw)
+            except ValueError:
+                print("Please enter a valid whole number.")
+                continue
+            if value <= 0:
+                print("Value must be greater than zero.")
+                continue
+            return value
+
+    @staticmethod
+    def _prompt_positive_decimal(prompt: str) -> Decimal:
+        while True:
+            raw = input(prompt).strip().replace(",", "")
+            try:
+                value = Decimal(raw)
+            except InvalidOperation:
+                print("Please enter a valid amount (e.g., 150 or 49.50).")
+                continue
+            if not value.is_finite() or value <= Decimal("0"):
+                print("Amount must be greater than zero.")
+                continue
+            return value.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+
+    def add_study_log(self) -> None:
+        print("\n--- Add Study Log ---")
+        topic = self._prompt_text("Topic   : ")
+        subject = self._prompt_text("Subject : ")
+        minutes = self._prompt_positive_int("Minutes : ")
+
+        log = StudyLog(title=topic, category=subject, minutes=minutes)
+        self.repository.add(log)
+        print(f"Saved study log: {log.title} [{log.category}] - {log.display_value}")
+
+    def add_expense_log(self) -> None:
+        print("\n--- Add Expense ---")
+        item = self._prompt_text("Item         : ")
+        category = self._prompt_text("Category     : ")
+        amount = self._prompt_positive_decimal(f"Amount ({CURRENCY_SYMBOL}) : ")
+
+        log = ExpenseLog(title=item, category=category, amount=amount)
+        self.repository.add(log)
+        print(f"Saved expense: {log.title} [{log.category}] - {log.display_value}")
+
+    def show_summary(self) -> None:
+        records, skipped = self.repository.load_all()
+        report = build_summary(records)
+
+        if report.is_empty:
+            print("\nNo records found yet. Add a study log or expense to begin.")
+            return
+
+        print("\n" + "=" * 46)
+        print("                SUMMARY REPORT")
+        print("=" * 46)
+        print(
+            f"Total Study   : {format_duration(report.total_study_minutes)}"
+            f" ({report.study_sessions} session(s))"
+        )
+        print(
+            f"Total Expense : {format_currency(report.total_expense)}"
+            f" ({report.expense_entries} entry/entries)"
+        )
+
+        if report.study_by_subject:
+            print("\nStudy Breakdown by Subject:")
+            for subject, mins in report.study_by_subject.items():
+                print(f"  - {subject:<18} {format_duration(mins)}")
+
+        if report.expense_by_category:
+            print("\nExpense Breakdown by Category:")
+            for category, total in report.expense_by_category.items():
+                print(f"  - {category:<18} {format_currency(total)}")
+
+        if skipped:
+            print(f"\nNote: Skipped {skipped} malformed record(s) while loading.")
+        print("=" * 46)
+
+    def show_recent_logs(self, limit: int = 10) -> None:
+        records, skipped = self.repository.load_all()
+        if not records:
+            print("\nNo logs recorded yet.")
+            return
+
+        recent = list(reversed(records[-limit:]))
+        print(f"\n--- Recent Logs (showing latest {len(recent)} of {len(records)}) ---")
+        print(f"{'Date':<16} | {'Type':<7} | {'Category':<14} | {'Title':<20} | Value")
+        print("-" * 78)
+        for record in recent:
+            title = (
+                record.title[:17] + "..." if len(record.title) > 20 else record.title
+            )
+            category = (
+                record.category[:11] + "..."
+                if len(record.category) > 14
+                else record.category
+            )
+            print(
+                f"{record.created_at:<16} | "
+                f"{record.record_type.value:<7} | "
+                f"{category:<14} | "
+                f"{title:<20} | "
+                f"{record.display_value}"
+            )
+
+        if skipped:
+            print(f"\nNote: Skipped {skipped} malformed record(s) while loading.")
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Track study sessions and personal expenses from the terminal."
+    )
+    parser.add_argument(
+        "--file",
+        type=Path,
+        default=DEFAULT_DATA_FILE,
+        help=f"Path to the JSON data file (default: {DEFAULT_DATA_FILE}).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Application entry point."""
+    args = parse_args(argv)
+    repository = JsonRecordRepository(file_path=args.file)
+    cli = TrackerCLI(repository=repository)
+    cli.run()
+
+
+if __name__ == "__main__":
+    main()
+```
